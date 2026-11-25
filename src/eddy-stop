@@ -1,0 +1,40 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Stop development environment.
+ */
+
+declare(strict_types=1);
+
+namespace DrevOps\Eddy\Tooling;
+
+require_once __DIR__ . '/helpers.php';
+
+// -----------------------------------------------------------------------------
+// Variables.
+// -----------------------------------------------------------------------------
+
+// Webserver port resolved via the env -> '.env' -> default chain.
+$webserver_port = resolve_webserver()['port'];
+
+// The docroot identifies the webserver of this project among the processes
+// that listen on the port.
+$root = (string) getcwd();
+$docroot = $root . '/build/web';
+
+// -----------------------------------------------------------------------------
+
+echo '===============================' . "\n";
+echo '      💻 STOP ENVIRONMENT      ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+
+environment_stop($webserver_port, $docroot);
+
+echo "\n";
+echo '===============================' . "\n";
+echo '   💻 ENVIRONMENT STOPPED ✅  ' . "\n";
+echo '===============================' . "\n";
+echo "\n";

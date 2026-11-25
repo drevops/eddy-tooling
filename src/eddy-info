@@ -1,0 +1,175 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Print a read-only summary of the current development environment.
+ *
+ * Resolves PHP, Drupal, Composer, Drush, Node, and npm versions; the
+ * webserver host and port along with where each value was sourced from
+ * (shell env vs '.env' vs default); the running server's XDebug state; the
+ * WebDriver port, which the summary shows only in a project with
+ * FunctionalJavascript tests; the build directory; the SQLite database path;
+ * and the active Drupal install profile.
+ *
+ * Any value that cannot be resolved prints '-' rather than failing.
+ *
+ * Two output modes:
+ * - No arguments: print the formatted full summary.
+ * - 'eddy-info <field>': print only that field's value on stdout, exit 0.
+ *   Unknown field name prints '-' and exits 1.
+ *
+ * The 'webdriver-backend' and 'webdriver-host' fields print in field mode
+ * only. 'webdriver-host' prints an empty line while WEBDRIVER_HOST is unset,
+ * since its default depends on the backend.
+ *
+ * Field-mode keeps expensive subprocess probes lazy: only the requested
+ * field's resolver runs.
+ */
+
+declare(strict_types=1);
+
+namespace DrevOps\Eddy\Tooling;
+
+require_once __DIR__ . '/helpers.php';
+
+// -----------------------------------------------------------------------------
+// Cheap resolutions (env + filesystem). Always run.
+// -----------------------------------------------------------------------------
+
+$webserver = resolve_webserver(validate_port: FALSE);
+$webserver_host = $webserver['host'];
+$host_source = $webserver['host_source'];
+$webserver_port = $webserver['port'];
+$port_source = $webserver['port_source'];
+
+$drupal_profile = drupal_profile();
+
+$root = (string) getcwd();
+$build_dir = is_dir($root . '/build') ? $root . '/build' : '-';
+$has_functional_javascript = is_dir($root . '/tests/src/FunctionalJavascript');
+
+$info_files = glob('*.info.yml');
+$extension_name = (is_array($info_files) && $info_files !== []) ? basename($info_files[0], '.info.yml') : '';
+$db_file = $extension_name !== '' ? site_db_file($extension_name) : '-';
+
+$drush_bin = 'build/vendor/bin/drush';
+$has_drush = is_file($drush_bin);
+
+// -----------------------------------------------------------------------------
+// Field resolvers. Each closure is invoked only when its field is requested.
+// -----------------------------------------------------------------------------
+
+$fields = [
+  'drupal-version' => fn(): string => $has_drush ? info_drupal_version($drush_bin, $root) : '-',
+  'php-version' => info_php_version(...),
+  'composer' => fn(): string => info_tool_version('composer --version 2>' . null_device(), '/Composer(?:\s+version)?\s+(\S+)/i'),
+  'drush' => fn(): string => $has_drush ? info_tool_version(escapeshellarg(shell_path($drush_bin)) . ' --version 2>' . null_device(), '/(\d+\.\d+\.\d+)/') : '-',
+  'node' => fn(): string => info_tool_version('node --version 2>' . null_device(), '/v?(.+)/'),
+  'npm' => fn(): string => info_tool_version('npm --version 2>' . null_device(), '/(.+)/'),
+  'webserver-host' => fn(): string => $webserver_host,
+  'webserver-port' => fn(): string => $webserver_port,
+  'site-url' => fn(): string => resolve_site_url($webserver_host, $webserver_port),
+  'xdebug' => fn(): string => xdebug_state($webserver_port, $root . '/build/web'),
+  'webdriver-port' => fn(): string => resolve_webdriver_port(validate_port: FALSE)['port'],
+  'webdriver-backend' => fn(): string => resolve_env_value('WEBDRIVER_BACKEND', 'chromedriver')['value'],
+  'webdriver-host' => fn(): string => resolve_env_value('WEBDRIVER_HOST', '')['value'],
+  'build-dir' => fn(): string => $build_dir,
+  'database' => fn(): string => $db_file,
+  'drupal-profile' => fn(): string => $drupal_profile,
+];
+
+// -----------------------------------------------------------------------------
+// Field-mode dispatch.
+// -----------------------------------------------------------------------------
+
+$field = isset($argv[1]) && !str_starts_with($argv[1], '-') ? $argv[1] : NULL;
+
+if ($field !== NULL) {
+  if (isset($fields[$field])) {
+    echo $fields[$field]() . "\n";
+    quit(0);
+  }
+
+  echo '-' . "\n";
+  quit(1);
+}
+
+// -----------------------------------------------------------------------------
+// Full summary. Resolves every field then formats.
+// -----------------------------------------------------------------------------
+
+$values = array_map(fn(callable $cb): string => $cb(), $fields);
+$php_path = command_path('php');
+
+echo '===============================' . "\n";
+echo '      ℹ️ ENVIRONMENT INFO      ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+echo 'Drupal version:     ' . $values['drupal-version'] . "\n";
+echo 'PHP version:        ' . $values['php-version'] . ($php_path !== FALSE && $values['php-version'] !== '-' ? ' (' . $php_path . ')' : '') . "\n";
+echo 'Composer:           ' . $values['composer'] . "\n";
+echo 'Drush:              ' . $values['drush'] . "\n";
+echo 'Node / npm:         ' . $values['node'] . ' / ' . $values['npm'] . "\n";
+echo "\n";
+echo 'Webserver host:     ' . $values['webserver-host'] . ' (' . $host_source . ')' . "\n";
+echo 'Webserver port:     ' . $values['webserver-port'] . ' (' . $port_source . ')' . "\n";
+echo 'Site URL:           ' . $values['site-url'] . "\n";
+echo 'XDebug:             ' . $values['xdebug'] . "\n";
+
+if ($has_functional_javascript) {
+  echo 'WebDriver port:     ' . $values['webdriver-port'] . "\n";
+}
+
+echo "\n";
+echo 'Build dir:          ' . $values['build-dir'] . "\n";
+echo 'Database:           ' . $values['database'] . "\n";
+echo 'Drupal profile:     ' . $values['drupal-profile'] . "\n";
+echo "\n";
+
+// -----------------------------------------------------------------------------
+// Local helpers.
+// -----------------------------------------------------------------------------
+
+/**
+ * Get the host PHP version, or '-' if it cannot be parsed.
+ */
+function info_php_version(): string {
+  $output = (string) @shell_exec('php -v 2>' . null_device());
+
+  if ($output === '' || !preg_match('/^PHP\s+(\S+)/m', $output, $matches)) {
+    return '-';
+  }
+
+  return $matches[1];
+}
+
+/**
+ * Run a version probe and extract the first capture group.
+ *
+ * Returns '-' if the command produces no output or the pattern does
+ * not match.
+ */
+function info_tool_version(string $command, string $pattern): string {
+  $output = trim((string) @shell_exec($command));
+
+  if ($output === '' || !preg_match($pattern, $output, $matches)) {
+    return '-';
+  }
+
+  return trim($matches[1]);
+}
+
+/**
+ * Get the installed Drupal version via drush, or '-' if unavailable.
+ */
+function info_drupal_version(string $drush_bin, string $root): string {
+  // Intentionally bypasses drush(): outside debug mode that helper merges
+  // stderr into its return value, which would leak any stray notice into
+  // the version string returned here. This probe
+  // instead discards stderr so it always yields either a clean value or '-'.
+  $command = escapeshellarg(shell_path($drush_bin)) . ' -r ' . escapeshellarg($root . '/build/web') . ' status --field=drupal-version 2>' . null_device();
+  $output = trim((string) @shell_exec($command));
+
+  return $output === '' ? '-' : $output;
+}

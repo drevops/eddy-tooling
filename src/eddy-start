@@ -1,0 +1,117 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Start development environment.
+ */
+
+declare(strict_types=1);
+
+namespace DrevOps\Eddy\Tooling;
+
+require_once __DIR__ . '/helpers.php';
+
+// -----------------------------------------------------------------------------
+// Variables.
+// -----------------------------------------------------------------------------
+
+// Webserver host and port. The helper resolves both via the
+// env -> '.env' -> default chain. With auto_discover: TRUE, a free
+// port is allocated and persisted to '.env' when neither env nor
+// '.env' provides one.
+$webserver = resolve_webserver(auto_discover: TRUE);
+$webserver_host = $webserver['host'];
+$webserver_port = $webserver['port'];
+
+// Webserver wait timeout.
+$webserver_wait_timeout = validate_timeout_or_fail(resolve_env_value('WEBSERVER_WAIT_TIMEOUT', '5')['value'], 'WEBSERVER_WAIT_TIMEOUT');
+
+// Webserver log file.
+$webserver_log = LOGS_DIR . '/php.log';
+
+// The docroot identifies the webserver of this project among the processes
+// that listen on the port.
+$root = (string) getcwd();
+$docroot = $root . '/build/web';
+
+// Enable XDebug when XDEBUG is set in the environment or '.env'. XDebug
+// extension must be installed and configured on host environment (php -v
+// should show `with Xdebug`). The flags apply only to the development server,
+// so test commands keep pcov as the coverage driver.
+$xdebug_enabled = resolve_env_value('XDEBUG', '')['value'] !== '';
+$xdebug_flags = $xdebug_enabled ? ' -d xdebug.mode=debug -d xdebug.start_with_request=yes' : '';
+
+// -----------------------------------------------------------------------------
+
+echo '===============================' . "\n";
+echo '      💻 START ENVIRONMENT     ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+
+if ($xdebug_enabled) {
+  TASK('Verifying that the XDebug PHP extension is installed.');
+  $output = (string) shell_exec('php -v 2>' . null_device());
+
+  if (stripos($output, 'xdebug') === FALSE) {
+    FAIL('XDEBUG=1 is set but the XDebug PHP extension is not installed on the host. Install it (see https://xdebug.org/docs/install) and try again.');
+  }
+
+  PASS('XDebug extension is loaded.');
+}
+
+TASK('Stopping previously started services, if any.');
+$listeners = webserver_listeners($webserver_port, $docroot);
+
+if ($listeners['other'] !== []) {
+  fail_port_in_use($webserver_port, 'WEBSERVER_PORT', $listeners['other']);
+}
+
+kill_processes(array_keys($listeners['own']));
+
+TASK('Starting the PHP webserver.');
+mkdir_or_fail(dirname($webserver_log));
+// A Windows background command reads PATH from the environment of the user,
+// so it names the PHP that runs this command.
+run_in_background(sprintf('%s%s -S %s:%s -t %s %s', is_windows() ? escapeshellarg(PHP_BINARY) : 'php', $xdebug_flags, escapeshellarg($webserver_host), escapeshellarg($webserver_port), escapeshellarg($docroot), escapeshellarg($docroot . '/.ht.router.php')), $webserver_log);
+
+NOTE('Waiting up to %s seconds for the server to be ready.', (string) $webserver_wait_timeout);
+
+if (!wait_for_port(client_host($webserver_host), $webserver_port, $webserver_wait_timeout)) {
+  $content = file_read($webserver_log);
+  FAIL('Unable to start inbuilt PHP server.%s', $content !== '' ? "\n" . $content : '');
+}
+
+PASS('Server started successfully.');
+
+TASK('Checking that the server can serve content.');
+$context = stream_context_create(['http' => ['method' => 'HEAD', 'timeout' => 5, 'ignore_errors' => TRUE]]);
+$headers = @get_headers(sprintf('http://%s:%s', client_host($webserver_host), $webserver_port), FALSE, $context);
+
+if ($headers === FALSE || !isset($headers[0]) || (!str_contains($headers[0], '200') && !str_contains($headers[0], '302'))) {
+  FAIL('Server is started, but site cannot be served.');
+}
+
+PASS('Server can serve content.');
+
+if (tunnel_enabled()) {
+  tunnel_start($webserver_port);
+}
+
+// Run custom post-start scripts from "scripts/start-*.sh", if any.
+run_custom_scripts('scripts', 'start-');
+
+$site_url = resolve_site_url($webserver_host, $webserver_port);
+
+echo "\n";
+echo '===============================' . "\n";
+echo '    💻 ENVIRONMENT READY  ✅  ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+echo 'Directory : ' . $docroot . "\n";
+echo 'URL       : ' . $site_url . "\n";
+echo 'XDebug    : ' . ($xdebug_enabled ? 'Enabled' : 'Disabled') . "\n";
+echo "\n";
+echo '> Next steps:' . "\n";
+echo '  vendor/bin/eddy-provision    # Provision the website' . "\n";
+echo "\n";

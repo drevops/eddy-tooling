@@ -1,0 +1,437 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Start the WebDriver backend for FunctionalJavascript tests.
+ *
+ * The backend is selected via WEBDRIVER_BACKEND:
+ * - 'chromedriver' (default): a small WebDriver server that drives the Chrome
+ *   already installed on the machine, so no Docker is required.
+ * - 'selenium': the browser runs inside a Docker container.
+ *
+ * Both backends serve the WebDriver endpoint on the same per-project port
+ * (env -> '.env' -> 4444). Starting either one auto-discovers a free port
+ * from 4444 and persists it to '.env' like the webserver port, so several
+ * projects can run their own endpoint simultaneously without contending for
+ * a single port.
+ *
+ * A server of the selected backend that already accepts sessions on the port
+ * is reused, whichever project started it, since every session is
+ * independent. The browser reaches the webserver at a different address from
+ * each backend, so a server of the other backend is not reused.
+ *
+ * Anything else on the port is replaced only when it is the project's own
+ * backend, whichever backend that is. A running Selenium container of another
+ * project, or another process, fails the command and is named instead.
+ *
+ * A stopped Selenium container holds no port and is replaced whichever
+ * project started it.
+ */
+
+declare(strict_types=1);
+
+namespace DrevOps\Eddy\Tooling;
+
+require_once __DIR__ . '/helpers.php';
+
+// Directory holding the downloaded chromedriver binary and its install log.
+// Ignored by git and safe to delete.
+const CHROMEDRIVER_DIR = '.chromedriver';
+
+const CHROMEDRIVER_LOG_FILE = LOGS_DIR . '/chromedriver.log';
+
+const SELENIUM_IMAGE = 'selenium/standalone-chromium:latest';
+
+const VERSION_PROBE_TIMEOUT = 10;
+
+// -----------------------------------------------------------------------------
+// Variables.
+// -----------------------------------------------------------------------------
+
+// WebDriver backend: 'chromedriver' (default) or 'selenium'.
+$webdriver_backend = webdriver_backend();
+
+// WebDriver port resolved via the env -> '.env' -> default chain. With
+// auto_discover: TRUE, a free port is allocated and persisted to '.env' when
+// neither env nor '.env' provides one.
+$webdriver_port = resolve_webdriver_port(auto_discover: TRUE)['port'];
+
+// The project root identifies the backend that this project started.
+$root = (string) getcwd();
+
+// -----------------------------------------------------------------------------
+
+echo '===============================' . "\n";
+echo '       🌐 START BROWSER        ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+
+if ($webdriver_backend === 'selenium') {
+  selenium_start($webdriver_port, $root);
+}
+else {
+  chromedriver_start($webdriver_port, $root);
+}
+
+echo "\n";
+echo '===============================' . "\n";
+echo '      🌐 BROWSER READY ✅     ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+
+// -----------------------------------------------------------------------------
+// Local helpers.
+// -----------------------------------------------------------------------------
+
+/**
+ * Resolve the WebDriver backend, aborting on an unsupported value.
+ */
+function webdriver_backend(): string {
+  $backend = resolve_env_value('WEBDRIVER_BACKEND', 'chromedriver')['value'];
+
+  if (!in_array($backend, ['chromedriver', 'selenium'], TRUE)) {
+    FAIL("Unknown WEBDRIVER_BACKEND '%s'. Use 'chromedriver' or 'selenium'.", $backend);
+  }
+
+  return $backend;
+}
+
+/**
+ * Fail when another project's backend or another process holds the port.
+ *
+ * Called once the port has no server of the selected backend that accepts
+ * sessions, so the holder is not reusable.
+ *
+ * Only a running Selenium container holds the port, since a stopped one
+ * publishes none. The project's own running container accounts for the
+ * process that publishes its port, so the listeners are checked only without
+ * one.
+ */
+function webdriver_fail_when_taken(string $port, string $root): void {
+  $container_project = command_path('docker') !== FALSE && selenium_container_running($port) ? selenium_container_project($port) : NULL;
+
+  if (!in_array($container_project, [NULL, '', $root], TRUE)) {
+    FAIL_NO_EXIT('Port %s is in use by the Selenium container of another project. Stop its browser, or set WEBDRIVER_PORT in .env to a free port.', $port);
+    NOTE('%s %s', selenium_container($port), $container_project);
+    quit(1);
+  }
+
+  if ($container_project !== NULL) {
+    return;
+  }
+
+  $other = webdriver_listeners($port, $root)['other'];
+
+  if ($other === []) {
+    return;
+  }
+
+  fail_port_in_use($port, 'WEBDRIVER_PORT', $other);
+}
+
+/**
+ * Ensure a chromedriver matching the installed Chrome is listening.
+ */
+function chromedriver_start(string $port, string $root): void {
+  if (webdriver_ready($port, 'chromedriver')) {
+    PASS('chromedriver is already running on port %s.', $port);
+
+    return;
+  }
+
+  webdriver_fail_when_taken($port, $root);
+
+  $chrome_version = detect_chrome_version();
+
+  if ($chrome_version === '') {
+    FAIL('Google Chrome or Chromium was not found. Install Chrome, or set WEBDRIVER_BACKEND=selenium to use Docker.');
+  }
+
+  $binary = resolve_chromedriver_binary($chrome_version);
+
+  mkdir_or_fail(dirname(CHROMEDRIVER_LOG_FILE));
+
+  // The project's own backend is stopped only once chromedriver can launch,
+  // so a missing prerequisite leaves it running. A running container here is
+  // the project's own: webdriver_fail_when_taken() fails on any other.
+  if (command_path('docker') !== FALSE && selenium_container_running($port)) {
+    TASK('Removing the Selenium container %s.', selenium_container($port));
+    passthru_or_fail(sprintf('docker rm -f %s', escapeshellarg(selenium_container($port))), 'Failed to remove the Selenium container %s.', selenium_container($port));
+  }
+
+  chromedriver_stop($port, $root);
+
+  TASK('Starting chromedriver on port %s.', $port);
+  run_in_background(sprintf('%s --port=%s', escapeshellarg($binary), escapeshellarg($port)), CHROMEDRIVER_LOG_FILE);
+
+  NOTE('Waiting for chromedriver to be ready.');
+
+  if (webdriver_wait_ready($port, 'chromedriver')) {
+    PASS('chromedriver is ready on port %s.', $port);
+
+    return;
+  }
+
+  FAIL('chromedriver failed to become ready on port %s after 30 seconds; see %s.', $port, CHROMEDRIVER_LOG_FILE);
+}
+
+/**
+ * Stop the chromedriver processes of the project that listen on the port.
+ */
+function chromedriver_stop(string $port, string $root): void {
+  $own = webdriver_listeners($port, $root)['own'];
+
+  if ($own === []) {
+    return;
+  }
+
+  TASK('Stopping chromedriver on port %s.', $port);
+  kill_processes(array_keys($own));
+}
+
+/**
+ * Ensure a Selenium container is serving the WebDriver endpoint.
+ *
+ * The container carries the project root in its SELENIUM_PROJECT_LABEL label,
+ * so 'eddy-browser-stop' in another project that recorded the same port
+ * leaves it running.
+ */
+function selenium_start(string $port, string $root): void {
+  if (webdriver_ready($port, 'selenium')) {
+    PASS('Selenium is already running on port %s.', $port);
+
+    return;
+  }
+
+  if (command_path('docker') === FALSE) {
+    FAIL('docker was not found. Install Docker, or unset WEBDRIVER_BACKEND to use the locally installed Chrome.');
+  }
+
+  webdriver_fail_when_taken($port, $root);
+  chromedriver_stop($port, $root);
+
+  TASK('Starting the Selenium container on port %s.', $port);
+  selenium_container_remove($port);
+
+  // The default 64 MB '/dev/shm' is too small for Chromium and leads to tab
+  // crashes mid-test; the Selenium images document 2g as the required size.
+  passthru_or_fail(sprintf('docker run -d --name %s --label %s --shm-size=2g -p %s:4444 %s', escapeshellarg(selenium_container($port)), escapeshellarg(SELENIUM_PROJECT_LABEL . '=' . $root), escapeshellarg($port), escapeshellarg(SELENIUM_IMAGE)), 'Failed to start the Selenium container.');
+
+  NOTE('Waiting for Selenium to be ready.');
+
+  if (webdriver_wait_ready($port, 'selenium')) {
+    PASS('Selenium is ready on port %s.', $port);
+
+    return;
+  }
+
+  FAIL('Selenium failed to become ready on port %s after 30 seconds.', $port);
+}
+
+/**
+ * Check whether a server of the backend accepts sessions on the given port.
+ *
+ * Both backends report '"ready": true' in the '/status' response body.
+ * Selenium serves HTTP 200 before it can accept sessions, so the body is
+ * inspected rather than the response status.
+ *
+ * The 'message' of the body names the server, such as 'ChromeDriver ready for
+ * new sessions.' or 'Selenium Grid ready.'.
+ *
+ * @param string $port
+ *   The WebDriver port.
+ * @param string $backend
+ *   The backend: 'chromedriver' or 'selenium'.
+ *
+ * @return bool
+ *   TRUE when the server on the port is of the backend and accepts sessions.
+ *
+ * @phpstan-impure
+ */
+function webdriver_ready(string $port, string $backend): bool {
+  $context = stream_context_create(['http' => ['method' => 'GET', 'timeout' => 2, 'ignore_errors' => TRUE]]);
+  $body = @file_get_contents(sprintf('http://localhost:%s/status', $port), FALSE, $context);
+  $status = is_string($body) ? json_decode($body, TRUE) : NULL;
+  $value = is_array($status) && is_array($status['value'] ?? NULL) ? $status['value'] : [];
+  $message = is_string($value['message'] ?? NULL) ? $value['message'] : '';
+
+  return ($value['ready'] ?? FALSE) === TRUE && str_starts_with($message, $backend === 'selenium' ? 'Selenium' : 'ChromeDriver');
+}
+
+/**
+ * Wait up to 30 seconds for a server of the backend to accept sessions.
+ *
+ * @param string $port
+ *   The WebDriver port.
+ * @param string $backend
+ *   The backend: 'chromedriver' or 'selenium'.
+ *
+ * @return bool
+ *   TRUE once the server on the port is of the backend and accepts sessions,
+ *   FALSE when no probe succeeds within the 30 seconds.
+ */
+function webdriver_wait_ready(string $port, string $backend): bool {
+  for ($i = 0; $i < 30; $i++) {
+    if (webdriver_ready($port, $backend)) {
+      return TRUE;
+    }
+
+    sleep(1);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Detect the installed Chrome/Chromium version, or '' when none is found.
+ *
+ * Aborts when the browser does not report its version in time.
+ */
+function detect_chrome_version(): string {
+  $binary = detect_chrome_binary();
+
+  if ($binary === '') {
+    return '';
+  }
+
+  // Chrome on Windows prints nothing for '--version', and installs each
+  // version into a directory named after it next to 'chrome.exe'.
+  if (is_windows()) {
+    $versions = array_values(array_filter(array_map(basename(...), glob(dirname($binary) . '/*', GLOB_ONLYDIR) ?: []), static fn(string $name): bool => preg_match('/^\d+(?:\.\d+){3}$/', $name) === 1));
+    sort($versions, SORT_NATURAL);
+
+    return $versions === [] ? '' : end($versions);
+  }
+
+  $output = command_output([$binary, '--version'], VERSION_PROBE_TIMEOUT);
+
+  if ($output === NULL) {
+    FAIL('The browser at %s did not report its version within %d seconds. Run it with --version to see why, or set WEBDRIVER_BACKEND=selenium to use Docker.', $binary, VERSION_PROBE_TIMEOUT);
+  }
+
+  return preg_match('/(\d+(?:\.\d+){3})/', (string) $output, $matches) === 1 ? $matches[1] : '';
+}
+
+/**
+ * Detect the installed Chrome/Chromium binary, or '' when none is found.
+ */
+function detect_chrome_binary(): string {
+  $mac_chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+  if (is_executable($mac_chrome)) {
+    return $mac_chrome;
+  }
+
+  // Chrome on Windows installs into the program files of the machine or of
+  // the user, which are not on PATH.
+  if (is_windows()) {
+    foreach (['ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'] as $variable) {
+      $base = getenv_default($variable, '');
+      $windows_chrome = $base . '\\Google\\Chrome\\Application\\chrome.exe';
+
+      if ($base !== '' && is_file($windows_chrome)) {
+        return $windows_chrome;
+      }
+    }
+  }
+
+  foreach (['google-chrome', 'chromium', 'chromium-browser'] as $candidate) {
+    $path = command_path($candidate);
+
+    if ($path !== FALSE) {
+      return $path;
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Resolve a chromedriver binary matching the given Chrome version.
+ *
+ * Prefers a chromedriver already on PATH that reports the major version of
+ * the installed Chrome; otherwise downloads a matching build via npx. Aborts
+ * when neither a matching driver nor npx is available.
+ */
+function resolve_chromedriver_binary(string $chrome_version): string {
+  $installed = detect_matching_chromedriver($chrome_version);
+
+  if ($installed !== '') {
+    return $installed;
+  }
+
+  if (command_path('npx') === FALSE) {
+    FAIL('No matching chromedriver found and npx is unavailable. Install a chromedriver matching Chrome %s, or set WEBDRIVER_BACKEND=selenium.', $chrome_version);
+  }
+
+  mkdir_or_fail(CHROMEDRIVER_DIR);
+  $log = CHROMEDRIVER_DIR . '/install.log';
+
+  TASK('Fetching chromedriver matching Chrome %s.', $chrome_version);
+  passthru_or_fail(sprintf('npx -y @puppeteer/browsers install %s --path %s >%s', escapeshellarg('chromedriver@' . $chrome_version), escapeshellarg(CHROMEDRIVER_DIR), escapeshellarg($log)), 'Failed to install chromedriver matching Chrome %s.', $chrome_version);
+
+  $binary = parse_installed_binary($log);
+
+  if ($binary === '') {
+    FAIL('Could not determine the chromedriver binary path.');
+  }
+
+  return $binary;
+}
+
+/**
+ * Detect a chromedriver on PATH matching the given Chrome version.
+ *
+ * Notes why an installed chromedriver is passed over: it did not report its
+ * version in time, or the major version it reports differs from Chrome's.
+ *
+ * @return string
+ *   The chromedriver path, or '' when no chromedriver on PATH can be used.
+ */
+function detect_matching_chromedriver(string $chrome_version): string {
+  $path = command_path('chromedriver');
+
+  if ($path === FALSE) {
+    return '';
+  }
+
+  $output = command_output([$path, '--version'], VERSION_PROBE_TIMEOUT);
+
+  if ($output === NULL) {
+    NOTE('Installed chromedriver at %s did not report its version within %d seconds; fetching a matching build.', $path, VERSION_PROBE_TIMEOUT);
+    // cspell:ignore xattr
+    NOTE('If macOS has quarantined it, clear the flag with: xattr -d com.apple.quarantine %s', escapeshellarg($path));
+
+    return '';
+  }
+
+  if (preg_match('/(\d+)\./', $output, $matches) !== 1 || $matches[1] !== explode('.', $chrome_version)[0]) {
+    NOTE('Installed chromedriver does not match Chrome %s; fetching a matching build.', $chrome_version);
+
+    return '';
+  }
+
+  NOTE('Using installed chromedriver at %s.', $path);
+
+  return $path;
+}
+
+/**
+ * Extract the installed binary path from the puppeteer/browsers log.
+ *
+ * The tool prints "chromedriver@<version> <path>" as its last line; the path
+ * may contain spaces, so everything after the first field is kept verbatim.
+ */
+function parse_installed_binary(string $log): string {
+  $lines = array_values(array_filter(split_lines(trim(file_read($log)))));
+
+  if ($lines === []) {
+    return '';
+  }
+
+  $last = end($lines);
+  $space = strpos($last, ' ');
+
+  return $space === FALSE ? '' : substr($last, $space + 1);
+}

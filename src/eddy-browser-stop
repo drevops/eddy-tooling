@@ -1,0 +1,67 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Stop the WebDriver backend for FunctionalJavascript tests.
+ *
+ * Whichever backend is running is stopped, regardless of WEBDRIVER_BACKEND.
+ * The port is resolved via the env -> '.env' -> 4444 chain instead of
+ * discovered, so the command targets the endpoint that 'eddy-browser-start'
+ * created.
+ *
+ * Only the backend that this project started is stopped: the Selenium
+ * container that its label assigns to the project root, and the chromedriver
+ * processes whose working directory is the root. A backend of another project
+ * that recorded the same port, or any other process on it, is left running.
+ */
+
+declare(strict_types=1);
+
+namespace DrevOps\Eddy\Tooling;
+
+require_once __DIR__ . '/helpers.php';
+
+// -----------------------------------------------------------------------------
+// Variables.
+// -----------------------------------------------------------------------------
+
+// WebDriver port resolved via the env -> '.env' -> default chain.
+$webdriver_port = resolve_webdriver_port()['port'];
+
+// The project root identifies the backend that this project started.
+$root = (string) getcwd();
+
+// -----------------------------------------------------------------------------
+
+echo '===============================' . "\n";
+echo '        🌐 STOP BROWSER        ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
+
+// The Selenium container publishes the port chromedriver would bind, so
+// killing the port process alone stops only the container's docker proxy.
+// Removing the container first frees the port whichever backend is running.
+$container_project = command_path('docker') !== FALSE ? selenium_container_project($webdriver_port) : NULL;
+
+if (in_array($container_project, ['', $root], TRUE)) {
+  TASK('Removing the Selenium container %s.', selenium_container($webdriver_port));
+  selenium_container_remove($webdriver_port);
+}
+elseif ($container_project !== NULL && selenium_container_running($webdriver_port)) {
+  NOTE('The Selenium container %s belongs to %s and was left running.', selenium_container($webdriver_port), $container_project);
+}
+
+TASK('Stopping the WebDriver process on port %s, if any.', $webdriver_port);
+$listeners = webdriver_listeners($webdriver_port, $root);
+kill_processes(array_keys($listeners['own']));
+sleep(1);
+PASS('Browser stopped on port %s.', $webdriver_port);
+
+note_port_in_use($webdriver_port, $listeners['other']);
+
+echo "\n";
+echo '===============================' . "\n";
+echo '     🌐 BROWSER STOPPED ✅    ' . "\n";
+echo '===============================' . "\n";
+echo "\n";
